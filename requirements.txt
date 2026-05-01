@@ -1,0 +1,3 @@
+flask
+gunicorn
+ortools==9.8.3296
