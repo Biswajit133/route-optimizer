@@ -1,10 +1,27 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from dotenv import load_dotenv
 import math
 import json
+import os
 import traceback
 
+# Must run before reading CORS_ORIGINS below - the blueprint modules also call
+# this on their own import, but that happens further down this file, after
+# CORS(app, ...) would otherwise have already read an empty env var.
+load_dotenv()
+
 app = Flask(__name__)
+
+# Angular runs on its own origin (localhost:4200 in dev), so the browser needs
+# an explicit CORS allow before it'll let those calls through - the JWT check
+# in each blueprint still does the actual auth. Comma-separated list so prod
+# origins can be added via env without another deploy.
+CORS_ORIGINS = [o.strip() for o in os.environ.get(
+    'CORS_ORIGINS', 'http://localhost:4200'
+).split(',') if o.strip()]
+CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
 
 # ✅ Accurate Haversine distance (meters)
 def distance(a, b):
@@ -322,7 +339,29 @@ def auto_assign():
 # if __name__ == '__main__':
 #     app.run(host='0.0.0.0', port=5000)
 
-import os
+# Every AI service is a blueprint so they all serve from this one app on one
+# port. Each module still runs on its own (`python delay_prediction.py`) for
+# training or debugging - see its __main__ block.
+from delay_prediction import bp as delay_bp
+from dynamic_reallocation import bp as reallocation_bp
+from no_show_prediction import bp as no_show_bp
+from ondemand_assignment import bp as ondemand_bp
+from route_schedule_optimization import bp as schedule_bp
+
+for blueprint in (delay_bp, reallocation_bp, no_show_bp, ondemand_bp, schedule_bp):
+    app.register_blueprint(blueprint)
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ok",
+        "routes": sorted(
+            rule.rule for rule in app.url_map.iter_rules()
+            if rule.endpoint != 'static'
+        ),
+    })
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))

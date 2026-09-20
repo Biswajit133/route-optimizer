@@ -1,7 +1,12 @@
 flask
+flask-cors
 gunicorn
-<<<<<<< HEAD
 ortools==9.15.6755
-=======
-ortools==9.8.3296
->>>>>>> c5c92a3 (initial commit)
+python-dotenv
+PyJWT
+pymysql
+pandas
+numpy
+scipy
+requests
+joblib
