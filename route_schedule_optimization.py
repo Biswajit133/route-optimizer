@@ -218,21 +218,27 @@ def slot_bounds(slot_date, slot_time):
     if not slot_date or not slot_time:
         return None, None
 
-    date_str = slot_date.strftime('%Y-%m-%d') if hasattr(slot_date, 'strftime') else str(slot_date)
+    date_str = slot_date.strftime('%Y-%m-%d') if hasattr(slot_date, 'strftime') else str(slot_date)[:10]
     parts = str(slot_time).split('-')
 
-    try:
-        start = datetime.strptime(f"{date_str} {parts[0].strip()}", '%Y-%m-%d %H:%M')
-    except ValueError:
+    # Slots are stored both as "16:00 - 17:00" and as "4:00 PM - 5:00 PM".
+    def at(clock):
+        clock = ' '.join(clock.strip().upper().split())
+        for fmt in ('%H:%M', '%I:%M %p', '%I:%M%p', '%H:%M:%S'):
+            try:
+                return datetime.strptime(f"{date_str} {clock}", f'%Y-%m-%d {fmt}')
+            except ValueError:
+                continue
+        return None
+
+    start = at(parts[0])
+    if start is None:
         return None, None
 
     if len(parts) == 2:
-        try:
-            end = datetime.strptime(f"{date_str} {parts[1].strip()}", '%Y-%m-%d %H:%M')
-            if end > start:
-                return start, end
-        except ValueError:
-            pass
+        end = at(parts[1])
+        if end is not None and end > start:
+            return start, end
 
     return start, start + timedelta(minutes=30)
 
@@ -391,6 +397,9 @@ def normalize_visit(raw, default_service_minutes):
         service = default_service_minutes
 
     pinned = raw.get('pinned_phlebo_id')
+    # Optional explicit eligibility from the caller (e.g. /batch-plan's radius
+    # rule). Absent means the area/city match below decides, as before.
+    explicit = parse_int_list(raw.get('allowed_phlebo_ids')) if raw.get('allowed_phlebo_ids') is not None else None
 
     return {
         "id": raw['id'],
@@ -402,6 +411,7 @@ def normalize_visit(raw, default_service_minutes):
         "city_id": int(raw.get('city_id') or 0),
         "service_seconds": max(0, service) * 60,
         "pinned_phlebo_id": int(pinned) if pinned else None,
+        "allowed_ids": explicit,
         "raw": raw,
     }, None
 
@@ -417,6 +427,11 @@ def allowed_phlebo_ids(visit, phlebos):
         pinned = [p['id'] for p in phlebos if p['id'] == visit['pinned_phlebo_id']]
         if pinned:
             return pinned
+
+    if visit.get('allowed_ids'):
+        explicit = [p['id'] for p in phlebos if int(p['id']) in visit['allowed_ids']]
+        if explicit:
+            return explicit
 
     allowed = []
     for p in phlebos:
@@ -1148,6 +1163,68 @@ def schedule_plan_endpoint():
         return jsonify({"success": False, "message": str(e)}), 400
     except KeyError as e:
         return jsonify({"success": False, "message": f"Missing configuration: {e}"}), 500
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# /batch-plan
+#
+# The web "Batch assign" page: the dispatcher picks one day, some phlebos and
+# some unassigned visits, and wants who-takes-what in driving order against
+# the slots - /optimize-schedule's answer. The one thing that endpoint cannot
+# know on its own is the country's matching rule: with
+# country_settings.phlebo_assign_via_radius on, eligibility is the phlebo's
+# serving_radius around their home base, not area/city. That needs the
+# caller's country_id (from the token) and phlebo_location_master, so it is
+# resolved here and handed to the solver as per-visit allowed_phlebo_ids -
+# the same rule, and the same helpers, /reallocate applies.
+#
+# Like every other planner here it only proposes. PHP's assign_phlebo_batch
+# writes what the dispatcher confirms.
+# ---------------------------------------------------------------------------
+
+@bp.route('/batch-plan', methods=['POST'])
+def batch_plan_endpoint():
+    # Reuse /reallocate's token + radius helpers rather than a third copy of
+    # them; imported here so this module still runs standalone without them.
+    from dynamic_reallocation import (
+        customer_id_from_token as token_claims, country_settings,
+        homebase_locations_for, allowed_phlebos_for, db_connection as realloc_db,
+    )
+    try:
+        _, country_id, auth_error = token_claims()
+        if auth_error:
+            return jsonify({"success": False, "message": auth_error}), 401
+
+        body = request.json or {}
+        phlebos = body.get('phlebos') or []
+        visits = body.get('visits') or []
+
+        settings = None
+        if country_id:
+            conn = realloc_db()
+            try:
+                settings = country_settings(conn, country_id)
+                if settings and settings.get('phlebo_assign_via_radius'):
+                    homebase = homebase_locations_for(conn, phlebos)
+                    located = [p for p in phlebos if coerce_point(p.get('lat'), p.get('lng'))]
+                    for v in visits:
+                        if v.get('pinned_phlebo_id') or not coerce_point(v.get('lat'), v.get('lng')):
+                            continue
+                        v['allowed_phlebo_ids'] = [
+                            p['id'] for p in allowed_phlebos_for(v, located, settings, homebase)
+                        ]
+            finally:
+                conn.close()
+
+        result = solve_schedule(phlebos, visits, now=parse_datetime(body.get('now')), options=body)
+        result['matchRule'] = 'radius' if settings and settings.get('phlebo_assign_via_radius') else 'area_city'
+        return jsonify(result)
+    except (KeyError, TypeError) as e:
+        return jsonify({"success": False, "message": f"Malformed phlebos/visits payload: {e}"}), 400
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
