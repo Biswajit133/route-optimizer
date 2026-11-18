@@ -1,0 +1,9 @@
+# Copilot service only (copilot_app.py). app.py keeps using requirements.txt.
+flask
+flask-cors
+gunicorn
+python-dotenv
+PyJWT
+pymysql
+requests
+cryptography
