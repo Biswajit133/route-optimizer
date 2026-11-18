@@ -8,6 +8,10 @@ GET    /copilot/conversations/<id>
 DELETE /copilot/conversations/<id>
 POST   /copilot/drafts/<id>/confirm     -> creates the order (orders create-order API, user's JWT)
 POST   /copilot/drafts/<id>/cancel
+POST   /copilot/actions/<id>/confirm    -> reschedule / cancel / assign / payment link (orders API, user's JWT)
+POST   /copilot/actions/<id>/cancel     close the action card, nothing changes
+POST   /copilot/actions/<id>/update     one edit from the action card (reason, note, date/slot, phlebo), no LLM
+GET    /copilot/actions/<id>/slots?date= -> slots of a date for the reschedule card
 POST   /copilot/drafts/<id>/update      one edit from the card (draft_edit.update_draft), no LLM
 GET    /copilot/drafts/<id>/slots?date= -> slots of a date for the card's slot editor
 GET    /copilot/tests?q=                -> bookable tests for the card's Add test box
@@ -18,7 +22,8 @@ from functools import wraps
 
 from flask import Blueprint, g, jsonify, request
 
-from . import agent, auth, draft_edit, orders_api, providers, settings, store, tools_customer, tools_order
+from . import (agent, auth, draft_edit, orders_api, providers, settings, store, tools_actions, tools_customer,
+               tools_order)
 
 log = logging.getLogger('copilot.routes')
 
@@ -33,6 +38,9 @@ SUGGESTIONS = [
     "Show today's orders without phlebo",
     "How do I add a new test?",
     "Book a home collection order",
+    "Assign today's orders without a phlebo",
+    "How much was collected this week?",
+    "Orders this month vs last month",
 ]
 
 
@@ -133,12 +141,17 @@ def chat():
     if ctx.get('lookups'):
         tools_customer.attach_message(ctx['lookups'], message_id)
         customer = tools_customer.get_card(ctx['lookups'][-1])
+    action = None
+    if ctx.get('actions'):
+        tools_actions.attach_message(ctx['actions'], message_id)
+        action = tools_actions.card_from_row(tools_actions.get_draft(p, ctx['actions'][-1]))
     return jsonify({'success': True, 'data': {
         'conversation_id': conversation_id,
         'message_id': message_id,
         'reply': result['reply'],
         'card': card,
         'customer': customer,
+        'action': action,
         'tools_used': [c['name'] for c in result['tool_calls']],
     }})
 
@@ -170,10 +183,15 @@ def conversation(conversation_id):
     except Exception as e:  # copilot_customer_lookups not created yet
         log.warning("customer cards unavailable: %s", e)
         customers = {}
+    try:
+        actions = tools_actions.cards_for_messages([r['id'] for r in rows if r['role'] == 'assistant'])
+    except Exception as e:  # copilot_action_drafts not created yet (004 SQL not run)
+        log.warning("action cards unavailable: %s", e)
+        actions = {}
     return jsonify({'success': True, 'data': {
         'id': conv['id'], 'title': conv['title'],
         'messages': [{'id': r['id'], 'role': r['role'], 'content': r['content'], 'failed': bool(r['failed']),
-                      'card': cards.get(int(r['id'])), 'customer': customers.get(int(r['id']))}
+                      'card': cards.get(int(r['id'])), 'customer': customers.get(int(r['id'])), 'action': actions.get(int(r['id']))}
                      for r in rows],
     }})
 
@@ -259,3 +277,49 @@ def find_tests():
     if not allowed:
         return fail(reason, 403)
     return jsonify({'success': True, 'data': draft_edit.find_tests(g.principal, request.args.get('q'))})
+
+
+# --------------------------------------------------------------------------- order action cards
+
+def _action_fail(e, draft_id):
+    return jsonify({'success': False, 'message': str(e), 'error': str(e),
+                    'card': tools_actions.card_from_row(tools_actions.get_draft(g.principal, draft_id))}), e.status
+
+
+@bp.route('/actions/<int:draft_id>/confirm', methods=['POST'])
+@requires_user
+def confirm_action(draft_id):
+    """The only place an order action runs: the user clicked the card's button."""
+    try:
+        card = tools_actions.confirm(g.principal, draft_id, request.headers.get('Authorization', ''))
+    except tools_actions.ActionProblem as e:
+        return _action_fail(e, draft_id)
+    return jsonify({'success': True, 'data': {'card': card}})
+
+
+@bp.route('/actions/<int:draft_id>/cancel', methods=['POST'])
+@requires_user
+def close_action(draft_id):
+    card = tools_actions.close(g.principal, draft_id)
+    if not card:
+        return fail("Card not found.", 404)
+    return jsonify({'success': True, 'data': {'card': card}})
+
+
+@bp.route('/actions/<int:draft_id>/update', methods=['POST'])
+@requires_user
+def update_action(draft_id):
+    try:
+        card = tools_actions.update(g.principal, draft_id, request.get_json(silent=True) or {})
+    except tools_actions.ActionProblem as e:
+        return _action_fail(e, draft_id)
+    return jsonify({'success': True, 'data': {'card': card}})
+
+
+@bp.route('/actions/<int:draft_id>/slots', methods=['GET'])
+@requires_user
+def action_slots(draft_id):
+    try:
+        return jsonify({'success': True, 'data': tools_actions.slot_choices(g.principal, draft_id, request.args.get('date'))})
+    except tools_actions.ActionProblem as e:
+        return fail(str(e), e.status)
