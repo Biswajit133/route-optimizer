@@ -4,11 +4,12 @@ import json
 import logging
 import time
 
-from . import clock, providers, tools_customer, tools_order, tools_read
+from . import clock, providers, tools_actions, tools_customer, tools_insights, tools_order, tools_read
 
 log = logging.getLogger('copilot.agent')
 
 MAX_ROUNDS = 8   # customer_history + search_tests + available_slots + prepare_order
+CARD_TOOLS = {'prepare_order', 'prepare_reschedule', 'prepare_cancel', 'prepare_assign', 'prepare_payment_link'}
 MAX_TOOL_RESULT_CHARS = 12000
 
 
@@ -22,11 +23,20 @@ What you can do now:
 - Answer questions about this lab's orders using the tools: counts and status (order_summary), one order's details
   (get_order), searching/listing orders (find_orders), today's problems (attention_needed), phlebo workload
   (phlebo_workload).
+- Money: what partner labs owe and what is received / pending / not invoiced (receivable_summary), what is owed to
+  phlebos and paid / unpaid (payable_summary), patient payments and cash collected (money_summary). "How much money /
+  earning" = receivable_summary; for profit, receivable_summary minus payable_summary for the same dates (say it
+  is an estimate: lab dues minus phlebo charges). Reports not uploaded yet (reports_pending), a test's
+  price / fasting / sample / package contents (test_info), phlebo performance (phlebo_performance), order trend vs an
+  earlier period (order_trend), coupons and self-booking link orders (coupon_booking_summary).
 - Explain how to do things in the CRM and where to find them (help_search).
 - Book a new HOME VISIT order: collect the details, look up tests (search_tests) and slots (available_slots), then call
   prepare_order. That shows the user a confirm card; the order is created only when the user clicks Confirm on it.
-You cannot edit, cancel, reschedule or assign orders, or book clinic/facility visits, yet. When asked to, say so
-politely and guide the user to the right page (use help_search for the steps and link).
+- Reschedule an order (prepare_reschedule), cancel an order (prepare_cancel), suggest and assign phlebos for one or
+  many orders (prepare_assign), and send the patient a payment link (prepare_payment_link). Each shows a card; nothing
+  changes until the user clicks the button on that card.
+You cannot edit order details (tests, address, patients), assign labs, or book clinic/facility visits, yet. When asked
+to, say so politely and guide the user to the right page (use help_search for the steps and link).
 
 Booking an order:
 - Needed: contact name and phone, address with pincode (or city), date, slot, and for each patient (max 8) name, age,
@@ -63,8 +73,28 @@ Booking an order:
 - If the user types "confirm"/"yes" instead of clicking, tell them to click Confirm on the card (you cannot confirm).
 - To change something on a card, call prepare_order again with the full corrected details (it replaces the old card).
 
+Order actions (reschedule, cancel, assign phlebo, payment link):
+- Use the order number the user gives. If they refer to "this/that order", use the one from the conversation; if
+  unclear, ask which order.
+- Reschedule: run available_slots for the new date, then prepare_reschedule with an exact slot. "kal bikele" /
+  "tomorrow evening" means the first free slot in that part of the day; if the asked time is not free, offer the nearest.
+- Pass the user's own words as reason when they give one; the card has the lab's reason list. Never ask for a reason
+  in chat - the user picks it on the card.
+- Cancel: call prepare_cancel straight away; do not ask "are you sure" in chat - the card is the confirmation.
+- "Who should I give this order to?", "assign X", "assign today's unassigned orders": call prepare_assign (order_refs,
+  or unassigned=true with the date). The card shows the suggestions; in one line name the suggested phlebo for a single
+  order, or say how many orders are on the card.
+- Payment link: call prepare_payment_link.
+- After any of these, reply in one or two lines and ask the user to check the card and click its button. Never say it
+  is done (rescheduled, cancelled, assigned, sent) - it is not until they click. If they type "yes"/"ok", tell them to
+  click the button on the card.
+- If a tool returns problems or an error, tell the user simply.
+
 Rules:
 - For ANY number, status or order detail, call a tool. Never guess or invent data. If a tool returns nothing, say so.
+- Date words: "this week" = Monday to today, "this month" = the 1st to today, "last month" = the whole previous
+  calendar month. For "this month vs last month" call order_trend with both periods; say that this month is not over.
+- Money: give the key totals in bold with the currency; if the tool says this user or lab cannot see it, say so.
 - "Today's orders" means orders scheduled for today (date_basis "slot") unless the user says booked/created.
   Mention which one you used when it matters.
 - Tools already restrict data to what this user may see. Never mention SQL, tools, JSON or internal IDs.
@@ -83,12 +113,13 @@ def openai_tools(p):
     tools = tools_read.openai_tools()
     tools += [{'type': 'function', 'function': {'name': name, 'description': t['description'],
                                                 'parameters': t['parameters']}}
-              for name, t in {**tools_customer.TOOLS, **tools_order.TOOLS}.items()]
+              for name, t in {**tools_customer.TOOLS, **tools_order.TOOLS, **tools_actions.TOOLS,
+                                 **tools_insights.TOOLS}.items()]
     return tools
 
 
 def run_tool(p, name, args, ctx):
-    for registry in (tools_customer.TOOLS, tools_order.TOOLS):
+    for registry in (tools_customer.TOOLS, tools_order.TOOLS, tools_actions.TOOLS, tools_insights.TOOLS):
         if name in registry:
             return registry[name]['handler'](p, args if isinstance(args, dict) else {}, ctx)
     return tools_read.run(p, name, args)
@@ -142,16 +173,17 @@ def run(p, conf, history, user_message, ctx=None):
                 for c in answer['tool_calls']],
         })
 
-        # One order card per answer: of several prepare_order calls in a round
+        # One card per answer: of several calls to the same card tool in a round
         # only the last runs, and a repeat with the same details reuses the card.
-        last_prepare = max((i for i, c in enumerate(answer['tool_calls']) if c['name'] == 'prepare_order'), default=None)
+        last_prepare = {c['name']: i for i, c in enumerate(answer['tool_calls']) if c['name'] in CARD_TOOLS}
         for i, call in enumerate(answer['tool_calls']):
             t0 = time.time()
             ok, error = True, None
-            key = json.dumps(call['arguments'], sort_keys=True, default=str) if call['name'] == 'prepare_order' else None
-            if key is not None and i != last_prepare:
+            key = (call['name'] + json.dumps(call['arguments'], sort_keys=True, default=str)
+                   if call['name'] in CARD_TOOLS else None)
+            if key is not None and i != last_prepare[call['name']]:
                 messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps(
-                    {'skipped': 'Only the last prepare_order call of this step was used.'})})
+                    {'skipped': f"Only the last {call['name']} call of this step was used."})})
                 continue
             if key is not None and key in prepared:
                 messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': prepared[key]})

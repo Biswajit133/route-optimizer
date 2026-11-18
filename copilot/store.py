@@ -73,6 +73,17 @@ def history(conversation_id):
         if r['id'] in notes:
             r['content'] = f"{r['content'] or ''}\n{notes[r['id']]}"
 
+    # ...and what became of each reschedule / cancel / assign / payment-link card.
+    try:
+        from .tools_actions import notes_for_messages as action_notes
+        notes = action_notes([r['id'] for r in rows if r['role'] == 'assistant'])
+    except Exception as e:  # copilot_action_drafts not created yet (004 SQL not run)
+        log.warning("history without action cards: %s", e)
+        notes = {}
+    for r in rows:
+        if r['id'] in notes:
+            r['content'] = f"{r['content'] or ''}\n{notes[r['id']]}"
+
     # The model expects the history to start with a user turn.
     while rows and rows[0]['role'] != 'user':
         rows.pop(0)
